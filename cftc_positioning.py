@@ -1,3 +1,11 @@
+"""CFTC positioning and SGX FX activity. Run: streamlit run cftc_positioning.py
+
+Dependencies: streamlit>=1.49, pandas>=2.1, plotly, scipy, requests.
+Single-file app: the SGX monthly snapshot is included below, so no extra files
+or packages are needed. CFTC reports download on demand. SGX data is a dated
+June-August 2026 snapshot, NOT an automatically updating SGX feed.
+"""
+
 from datetime import date
 from io import BytesIO
 from zipfile import BadZipFile, ZipFile
@@ -53,6 +61,56 @@ MARKETS_COMMODITIES = {
     'GULF # 6 FUEL OIL CRACK': ['GULF # 6 FUEL OIL CRACK - NEW YORK MERCANTILE EXCHANGE']
 }  
 
+SGX_MONTHLY_SOURCE = (
+    "https://links.sgx.com/FileOpen/SGX%20Monthly%20Statistics%20Report%20Update_Aug%202026.ashx"
+    "?App=Announcement&FileID=903915"
+)
+SGX_SNAPSHOT_MONTH = "2026-08"
+SGX_SNAPSHOT_MONTHS = ("2026-06-30", "2026-07-31", "2026-08-31")
+
+# Exact rows in SGX's August 2026 Monthly Market Statistics, pages 20-21
+# (volume) and 32-34 (month-end open interest). Each tuple is June, July, August.
+# Keep contract sizes separate. An absent options row is unknown, not zero.
+SGX_MONTHLY_SNAPSHOT = {
+    "USD_CNH FX Futures": {
+        "volume": (4989060, 4154962, 4138080), "oi": (200932, 214113, 247261),
+        "options_row": "USD_CNH FX Options",
+        "options_volume": (10919, 5032, 11756), "options_oi": (10998, 10568, 18902),
+    },
+    "INR_USD FX Futures": {
+        "volume": (3916421, 3720012, 3091812), "oi": (245722, 232700, 200546),
+        "options_row": "INR_USD FX Options",
+        "options_volume": (0, 0, 0), "options_oi": (0, 0, 0),
+    },
+    "KRW_USD FX Futures (Mini)": {
+        "volume": (1164513, 1197969, 748352), "oi": (29684, 35598, 39482),
+    },
+    "USD/SGD (Full-Sized) Futures": {
+        "volume": (405, 535, 310), "oi": (169, 189, 182),
+    },
+    "USD_SGD FX Futures": {
+        "volume": (1171, 1214, 1235), "oi": (796, 605, 607),
+    },
+    "THB_USD FX Futures": {
+        "volume": (2916, 1246, 911), "oi": (263, 277, 192),
+    },
+    "SGD_CNH FX Futures": {
+        "volume": (0, 0, 0), "oi": (0, 0, 0),
+    },
+    "TWD/USD Futures (Full Sized)": {
+        "volume": (42707, 45929, 44078), "oi": (259, 378, 407),
+    },
+}
+SGX_FX_ASSETS = {
+    "USD/CNH (SGX)": "USD_CNH FX Futures",
+    "INR/USD (SGX)": "INR_USD FX Futures",
+    "KRW/USD Mini (SGX)": "KRW_USD FX Futures (Mini)",
+    "USD/SGD (SGX)": "USD/SGD (Full-Sized) Futures",
+    "USD/THB (SGX reports THB/USD)": "THB_USD FX Futures",
+    "SGD/CNH (SGX)": "SGD_CNH FX Futures",
+    "TWD/USD Full-size (SGX)": "TWD/USD Futures (Full Sized)",
+}
+
 MARKETS_FX = {
     "EURO FX": ["EURO FX - CHICAGO MERCANTILE EXCHANGE"],
     "JAPANESE YEN": ["JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE"],
@@ -62,11 +120,8 @@ MARKETS_FX = {
     "AUSTRALIAN DOLLAR": ["AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE"],
     "MEXICAN PESO (MXN)": ["MEXICAN PESO - CHICAGO MERCANTILE EXCHANGE"],
     "BRAZILIAN REAL (BRL)": ["BRAZILIAN REAL - CHICAGO MERCANTILE EXCHANGE"],
-    # No verified CFTC TFF series for these currencies. Keep visible, but
-    # do not invent exchange names/codes or substitute another currency.
-    "OFFSHORE RENMINBI (CNH)": [],
-    "INDIAN RUPEE (INR)": [],
-    "KOREAN WON (KRW)": [],
+    # SGX entries route to their own activity view before any CFTC lookup.
+    **{label: [report_row] for label, report_row in SGX_FX_ASSETS.items()},
     "NEW ZEALAND DOLLAR": ["NZ DOLLAR - CHICAGO MERCANTILE EXCHANGE"],
     'SOUTH AFRICAN RAND': ['SO AFRICAN RAND - CHICAGO MERCANTILE EXCHANGE'],
     "US DOLLAR INDEX": ["USD INDEX - ICE FUTURES U.S."]
@@ -142,7 +197,6 @@ FX_CONTRACT_CODES = {
     "MEXICAN PESO (MXN)": "095741",
     "BRAZILIAN REAL (BRL)": "102741",
 }
-UNAVAILABLE_FX = {name for name, aliases in MARKETS_FX.items() if not aliases}
 REPORT_PREFIXES = {
     ("financial", "combined"): "com_fin_txt_",
     ("financial", "futures"): "fut_fin_txt_",
@@ -318,26 +372,112 @@ def latest_positions(df, cot_type):
     return pd.DataFrame(rows).set_index("Participant")
 
 
+def sgx_activity_frame(report_row, basis="futures"):
+    """Return published raw contract counts; never derive participant positions.
+
+    Futures and options counts stay separate even when 'combined' is selected.
+    Raw options OI cannot be converted to futures-equivalent OI without deltas.
+    """
+    if basis not in {"futures", "combined"}:
+        raise ValueError("Unsupported report basis")
+    values = SGX_MONTHLY_SNAPSHOT[report_row]
+    frame = pd.DataFrame({
+        "Month": pd.to_datetime(SGX_SNAPSHOT_MONTHS),
+        "Futures volume": values["volume"],
+        "Futures month-end OI": values["oi"],
+    })
+    if basis == "combined":
+        frame["Options volume"] = values.get("options_volume", float("nan"))
+        frame["Options month-end OI"] = values.get("options_oi", float("nan"))
+    return frame
+
+
+def render_sgx_fx(asset, basis):
+    """SGX activity view within the existing FX Futures market page."""
+    report_row = SGX_FX_ASSETS[asset]
+    if asset == "USD/SGD (SGX)":
+        variant = st.sidebar.selectbox("USD/SGD contract size", ["Full-sized", "Mini"])
+        if variant == "Mini":
+            report_row = "USD_SGD FX Futures"
+    frame = sgx_activity_frame(report_row, basis)
+    values = SGX_MONTHLY_SNAPSHOT[report_row]
+    as_of = frame["Month"].max()
+    st.subheader(f"{asset} · Monthly market activity")
+    st.caption(f"SGX report row: {report_row}")
+    st.markdown(f"Source: [SGX Monthly Market Statistics — August 2026]({SGX_MONTHLY_SOURCE}) · pages 20–21 and 32–34.")
+    st.caption("Bundled snapshot: June–August 2026. These figures are included in this Python file and do not update automatically.")
+    st.info("A public SGX FX participant long/short dataset has not been verified. This view shows trading volume and total open interest. Dealer, fund and other participant positions, net positions and positioning percentiles are unavailable.")
+    if report_row == "THB_USD FX Futures":
+        st.caption("Your USD/THB entry uses SGX's THB/USD contract. The published contract counts are shown unchanged; this is not an inverse price or position series.")
+    if report_row == "SGD_CNH FX Futures":
+        st.caption("SGX reports zero volume and zero open interest for all three displayed months. These are published zeros, not missing values.")
+
+    if basis == "combined":
+        if "options_row" in values:
+            st.caption(f"Futures + options selected: the separately published options row is {values['options_row']}. Raw futures and options counts are shown separately; they are not a futures-equivalent combined positioning report.")
+        else:
+            st.warning("Combined data unavailable: no matching options row was verified in this monthly report. The futures component is shown; options are blank, not assumed to be zero.")
+    else:
+        st.caption("Report basis: Futures only · Volume and open interest are raw contract counts.")
+
+    latest = frame.iloc[-1]
+    left, right = st.columns(2)
+    left.metric(f"Futures volume · {as_of:%b %Y}", f"{latest['Futures volume']:,.0f}")
+    right.metric(f"Futures open interest · {as_of:%d %b %Y}", f"{latest['Futures month-end OI']:,.0f}")
+    if basis == "combined" and "options_row" in values:
+        left, right = st.columns(2)
+        left.metric("Options volume", f"{latest['Options volume']:,.0f}")
+        right.metric("Options month-end open interest", f"{latest['Options month-end OI']:,.0f}")
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        subplot_titles=["Monthly trading volume", "Month-end open interest"])
+    for label, color in (("Futures", "#31b79a"), ("Options", "#e2b95b")):
+        volume, oi = f"{label} volume", f"{label} month-end OI"
+        if volume not in frame or frame[volume].isna().all():
+            continue
+        fig.add_trace(go.Bar(x=frame["Month"], y=frame[volume], name=label,
+                             marker_color=color, legendgroup=label), row=1, col=1)
+        fig.add_trace(go.Scatter(x=frame["Month"], y=frame[oi], name=label,
+                                 mode="lines+markers", line_color=color, connectgaps=False,
+                                 legendgroup=label, showlegend=False), row=2, col=1)
+    fig.update_yaxes(title_text="Contracts", rangemode="tozero")
+    fig.update_xaxes(tickvals=frame["Month"], tickformat="%b %Y")
+    fig.update_layout(height=580, barmode="group", hovermode="x unified")
+    st.plotly_chart(fig, width="stretch")
+    st.caption("Volume counts contracts traded during each month; open interest is outstanding contracts at month end. Neither reveals who is long or short. The snapshot has three monthly observations, so 12/18-month percentiles are not calculated.")
+    display = frame.copy()
+    display["Month"] = display["Month"].dt.strftime("%Y-%m")
+    formats = {column: "{:,.0f}" for column in display.columns if column != "Month"}
+    st.dataframe(display.style.format(formats, na_rep="—"), hide_index=True, width="stretch")
+    export = display.assign(Exchange="SGX", Contract=report_row,
+                            Data_type="Monthly activity; not participant positioning",
+                            Selected_basis=basis, Source_report=SGX_SNAPSHOT_MONTH,
+                            Source_url=SGX_MONTHLY_SOURCE)
+    safe_name = report_row.lower().replace(" ", "_").replace("/", "_")
+    st.download_button("Download SGX monthly activity", export.to_csv(index=False).encode("utf-8"),
+                       file_name=f"sgx_{safe_name}_{basis}_{SGX_SNAPSHOT_MONTH}.csv", mime="text/csv")
+
+
 def main():
-    st.set_page_config(page_title="CFTC Positioning", layout="wide")
-    st.title("CFTC Markets Participants Positioning")
+    st.set_page_config(page_title="Futures Positioning & Activity", layout="wide")
+    st.title("Futures Positioning & Market Activity")
     pages = {"FX Futures": MARKETS_FX, "Rate Futures": MARKETS_RATE, "Crypto Futures": MARKETS_CRYPTO,
              "Equity Index Futures": MARKETS_INDICES, "Commodity Futures": MARKETS_COMMODITIES}
     page = st.sidebar.selectbox("Select Market Page", list(pages))
-    asset = st.sidebar.selectbox(f"Select Asset ({page})", list(pages[page]),
-                                format_func=lambda name: f"{name} — no verified CFTC series" if name in UNAVAILABLE_FX else name)
+    asset = st.sidebar.selectbox(f"Select Asset ({page})", list(pages[page]))
     basis_label = st.sidebar.selectbox("Report basis", ["Futures + options combined", "Futures only"])
     basis = "combined" if basis_label == "Futures + options combined" else "futures"
     cot_type = "commodity" if page == "Commodity Futures" else "financial"
-    if st.sidebar.button("Refresh data"):
+    is_sgx = asset in SGX_FX_ASSETS
+    if st.sidebar.button("Refresh data", disabled=is_sgx,
+                         help="SGX uses the dated snapshot embedded in this file." if is_sgx else "Download fresh CFTC reports."):
         fetch_year.clear()
+    if is_sgx:
+        render_sgx_fx(asset, basis)
+        return
     st.caption(f"Source: CFTC · {basis_label} · Weekly report dates, not publication dates.")
     if basis == "combined":
         st.caption("Options are converted to futures-equivalent positions in the combined report.")
-    if asset in UNAVAILABLE_FX:
-        st.info(f"No verified CFTC TFF series is configured for {asset}. No matching currency series was found in the 2025–2026 TFF files checked on 23 September 2026. Exchange listing alone does not establish COT report coverage.")
-        st.caption("SGX-listed contracts require a separate SGX source; CME and SGX positions are distinct.")
-        return
     try:
         with st.spinner("Loading CFTC reports…"):
             report = fetch_cot_data(cot_type, basis)
