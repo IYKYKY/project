@@ -1,14 +1,16 @@
-import streamlit as st
-st.set_page_config(page_title="CFTC Positioning", layout="wide")
-import cot_reports as cot
+from datetime import date
+from io import BytesIO
+from zipfile import BadZipFile, ZipFile
+import logging
+
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from scipy.stats import percentileofscore
-
-# ----------------------------
-# Asset and participant mappings
-# ----------------------------
+import streamlit as st
 
 MARKETS_COMMODITIES = {
     "SOYBEANS": ["SOYBEANS - CHICAGO BOARD OF TRADE"],
@@ -21,7 +23,7 @@ MARKETS_COMMODITIES = {
     "COPPER": ["COPPER- #1 - COMMODITY EXCHANGE INC."],
     "COBALT": ["COBALT - COMMODITY EXCHANGE INC."],
     "CORN": ["CORN - CHICAGO BOARD OF TRADE"],
-    "COTTON": ["COTTON - ICE FUTURES U.S."],
+    "COTTON": ["COTTON NO. 2 - ICE FUTURES U.S.", "COTTON - ICE FUTURES U.S."],
     "SUGAR": ["SUGAR NO. 11 - ICE FUTURES U.S."],
     "COFFEE C": ["COFFEE C - ICE FUTURES U.S."],
     "COCOA": ["COCOA - ICE FUTURES U.S."],
@@ -58,7 +60,13 @@ MARKETS_FX = {
     "SWISS FRANC": ["SWISS FRANC - CHICAGO MERCANTILE EXCHANGE"],
     "CANADIAN DOLLAR": ["CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE"],
     "AUSTRALIAN DOLLAR": ["AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE"],
-    "MEXICAN PESO": ["MEXICAN PESO - CHICAGO MERCANTILE EXCHANGE"],
+    "MEXICAN PESO (MXN)": ["MEXICAN PESO - CHICAGO MERCANTILE EXCHANGE"],
+    "BRAZILIAN REAL (BRL)": ["BRAZILIAN REAL - CHICAGO MERCANTILE EXCHANGE"],
+    # No verified CFTC TFF series for these currencies. Keep visible, but
+    # do not invent exchange names/codes or substitute another currency.
+    "OFFSHORE RENMINBI (CNH)": [],
+    "INDIAN RUPEE (INR)": [],
+    "KOREAN WON (KRW)": [],
     "NEW ZEALAND DOLLAR": ["NZ DOLLAR - CHICAGO MERCANTILE EXCHANGE"],
     'SOUTH AFRICAN RAND': ['SO AFRICAN RAND - CHICAGO MERCANTILE EXCHANGE'],
     "US DOLLAR INDEX": ["USD INDEX - ICE FUTURES U.S."]
@@ -129,261 +137,260 @@ PARTICIPANTS_COM_OI = {
     "Non-Rept": ("Pct_of_OI_NonRept_Long_All", "Pct_of_OI_NonRept_Short_All")
 }
 
-def _strip_names(df):
-    if "Market_and_Exchange_Names" in df.columns:
-        df["Market_and_Exchange_Names"] = df["Market_and_Exchange_Names"].str.strip()
-    return df
-
-def _ensure_columns(df, cols):
-    for c in cols:
-        if c not in df.columns:
-            df[c] = 0
-    return df
-
-# ----------------------------
-# Fetch data
-# ----------------------------
-@st.cache_data
-def fetch_cot_data():
-    fin_df = cot.cot_all(cot_report_type="traders_in_financial_futures_futopt")
-    com_df = cot.cot_all(cot_report_type="disaggregated_futopt")
-
-    fin_df = _strip_names(fin_df)
-    com_df = _strip_names(com_df)
-
-    fin_assets = {**MARKETS_FX, **MARKETS_RATE, **MARKETS_CRYPTO, **MARKETS_INDICES}
-    asset_dfs_fin, asset_dfs_com = {}, {}
-
-    # financial
-    for asset, exact_names in fin_assets.items():
-        target = [n.strip() for n in exact_names]
-        matches = fin_df[fin_df["Market_and_Exchange_Names"].isin(target)]
-        if not matches.empty:
-            asset_dfs_fin[asset] = matches.copy()
-
-    # commodities
-    for asset, exact_names in MARKETS_COMMODITIES.items():
-        target = [n.strip() for n in exact_names]
-        matches = com_df[com_df["Market_and_Exchange_Names"].isin(target)]
-        if not matches.empty:
-            # ensure the 4 columns exist even if missing in this market/week
-            need = []
-            for a,b in PARTICIPANTS_COM.values():
-                need += [a,b]
-            matches = _ensure_columns(matches.copy(), need)
-            asset_dfs_com[asset] = matches
-
-    return asset_dfs_fin, asset_dfs_com
-
-
-
-# ----------------------------
-# Compute percentiles
-# ----------------------------
-def compute_latest_percentiles(asset_dfs, months_list=[12, 18], cot_type="financial"):
-    summary_list = []
-    participants_map = PARTICIPANTS_FIN if cot_type == "financial" else PARTICIPANTS_COM
-
-    for asset, df in asset_dfs.items():
-        df = df.copy()
-        df["Date"] = pd.to_datetime(df["Report_Date_as_YYYY-MM-DD"], errors="coerce")
-        df = df.dropna(subset=["Date"]).sort_values("Date")
-        latest_row = df.iloc[-1]
-
-        total_long = sum(latest_row[cols[0]] for cols in participants_map.values())
-        total_short = sum(latest_row[cols[1]] for cols in participants_map.values())
-        total_net = total_long - total_short
-
-        asset_summary = {
-            "asset": asset,
-            "total_long": int(total_long),
-            "total_short": int(total_short),
-            "total_net": int(total_net)
-        }
-
-        for months in months_list:
-            cutoff = pd.Timestamp.today() - pd.DateOffset(months=months)
-            df_hist = df[df["Date"] >= cutoff]
-
-            for p_name, (long_col, short_col) in participants_map.items():
-                long_val = latest_row.get(long_col, 0)
-                short_val = latest_row.get(short_col, 0)
-                net_val = long_val - short_val
-
-                long_pct = percentileofscore(df_hist[long_col].dropna(), long_val)
-                short_pct = percentileofscore(df_hist[short_col].dropna(), short_val)
-                net_pct = percentileofscore((df_hist[long_col]-df_hist[short_col]).dropna(), net_val)
-
-                asset_summary[f"{p_name} Long Percentile {months}m"] = round(long_pct, 2)
-                asset_summary[f"{p_name} Short Percentile {months}m"] = round(short_pct, 2)
-                asset_summary[f"{p_name} Net Percentile {months}m"] = round(net_pct, 2)
-
-        summary_list.append(asset_summary)
-    return pd.DataFrame(summary_list)
-
-# ----------------------------
-# Plot 4 stacked charts
-# ----------------------------
-def plot_4rows(asset, asset_dfs, cot_type="financial", months_back=18):
-    df = asset_dfs[asset].copy()
-    df["Date"] = pd.to_datetime(df["Report_Date_as_YYYY-MM-DD"], errors="coerce")
-    df = df.dropna(subset=["Date"]).sort_values("Date")
-    df = df[df["Date"] >= pd.Timestamp.today() - pd.DateOffset(months=months_back)]
-
-    participants_map = PARTICIPANTS_FIN if cot_type == "financial" else PARTICIPANTS_COM
-    fig = make_subplots(rows=len(participants_map), cols=1,
-                        subplot_titles=list(participants_map.keys()))
-    row = 1
-    for p_name, (long_col, short_col) in participants_map.items():
-        fig.add_trace(go.Bar(x=df["Date"], y=df.get(long_col, 0),   name=f"{p_name} Long"),  row=row, col=1)
-        fig.add_trace(go.Bar(x=df["Date"], y=-df.get(short_col, 0), name=f"{p_name} Short"), row=row, col=1)
-        net_val = df.get(long_col, 0) - df.get(short_col, 0)
-        fig.add_trace(go.Scatter(x=df["Date"], y=net_val, mode="lines", name=f"{p_name} Net"), row=row, col=1)
-        row += 1
-
-    fig.update_layout(height=280*len(participants_map), barmode="relative",
-                      title=dict(text=f"{asset} Positions (Last {months_back} Months)", x=0.5))
-    return fig
-
-def plot_oi_4rows(asset, asset_dfs, cot_type="financial", months_back=18):
-    df = asset_dfs[asset].copy()
-    df["Date"] = pd.to_datetime(df["Report_Date_as_YYYY-MM-DD"], errors="coerce")
-    df = df.dropna(subset=["Date"]).sort_values("Date")
-    df = df[df["Date"] >= pd.Timestamp.today() - pd.DateOffset(months=months_back)]
-
-    participants_map = PARTICIPANTS_FIN_OI if cot_type == "financial" else PARTICIPANTS_COM_OI
-    fig = make_subplots(rows=len(participants_map), cols=1,
-                        subplot_titles=list(participants_map.keys()))
-    row = 1
-    for p_name, (long_col, short_col) in participants_map.items():
-        fig.add_trace(go.Bar(x=df["Date"], y=df.get(long_col, 0),   name=f"{p_name} Long OI"),  row=row, col=1)
-        fig.add_trace(go.Bar(x=df["Date"], y=-df.get(short_col, 0), name=f"{p_name} Short OI"), row=row, col=1)
-        net_oi = df.get(long_col, 0) - df.get(short_col, 0)
-        fig.add_trace(go.Scatter(x=df["Date"], y=net_oi, mode="lines", name=f"{p_name} Net OI"), row=row, col=1)
-        row += 1
-
-    fig.update_layout(height=280*len(participants_map), barmode="relative",
-                      title=dict(text=f"{asset} Open Interest (Last {months_back} Months)", x=0.5))
-    return fig
-
-
-
-
-
-
-# ----------------------------
-# Streamlit App
-# ----------------------------
-st.title("CFTC Markets Participants Positioning")
-
-asset_dfs_fin, asset_dfs_com = fetch_cot_data()
-percentiles_fin = compute_latest_percentiles(asset_dfs_fin, cot_type="financial")
-percentiles_com = compute_latest_percentiles(asset_dfs_com, cot_type="commodity")
-
-pages = {
-    "FX Futures": MARKETS_FX,
-    "Rate Futures": MARKETS_RATE,
-    "Crypto Futures": MARKETS_CRYPTO,
-    "Equity Index Futures": MARKETS_INDICES,
-    "Commodity Futures": MARKETS_COMMODITIES
+# Verified against the CFTC annual TFF files; codes avoid name/spacing changes.
+FX_CONTRACT_CODES = {
+    "MEXICAN PESO (MXN)": "095741",
+    "BRAZILIAN REAL (BRL)": "102741",
 }
-
-page = st.sidebar.selectbox("Select Market Page", list(pages.keys()))
-assets = list(pages[page].keys())
-selected_asset = st.sidebar.selectbox(f"Select Asset ({page})", assets)
-
-# Choose which asset_dfs and percentiles_df to use
-if page == "Commodity Futures":
-    df_dict = asset_dfs_com
-    pct_df = percentiles_com
-    cot_type = "commodity"
-else:
-    df_dict = asset_dfs_fin
-    pct_df = percentiles_fin
-    cot_type = "financial"
-
-# Get latest available date for this asset
-latest_date = None
-if selected_asset in df_dict:
-    df_temp = df_dict[selected_asset].copy()
-    df_temp["Date"] = pd.to_datetime(df_temp["Report_Date_as_YYYY-MM-DD"], errors="coerce")
-    df_temp = df_temp.dropna(subset=["Date"])
-    if not df_temp.empty:
-        latest_date = df_temp["Date"].max().strftime("%Y-%m-%d")
-
-# ----------------------------
-# Show Charts
-# ----------------------------
-st.subheader(f"{selected_asset} Positioning" + (f" (Latest: {latest_date})" if latest_date else ""))
-st.plotly_chart(plot_4rows(selected_asset, df_dict, cot_type=cot_type, months_back=18))
-
-# ----------------------------
-# Show Open Interest Charts
-# ----------------------------
-st.subheader(f"{selected_asset} OI Percentages" + (f" (Latest: {latest_date})" if latest_date else ""))
-st.plotly_chart(plot_oi_4rows(selected_asset, df_dict, cot_type=cot_type, months_back=18))
+UNAVAILABLE_FX = {name for name, aliases in MARKETS_FX.items() if not aliases}
+REPORT_PREFIXES = {
+    ("financial", "combined"): "com_fin_txt_",
+    ("financial", "futures"): "fut_fin_txt_",
+    ("commodity", "combined"): "com_disagg_txt_",
+    ("commodity", "futures"): "fut_disagg_txt_",
+}
+DATE_COLUMN = "Report_Date_as_YYYY-MM-DD"
+NAME_COLUMN = "Market_and_Exchange_Names"
+CODE_COLUMN = "CFTC_Contract_Market_Code"
+LOOKBACKS = (12, 18)
 
 
-# ----------------------------
-# Show Percentiles
-# ----------------------------
-st.subheader(f"{selected_asset} Positioning Percentiles" + (f" (Latest: {latest_date})" if latest_date else ""))
-participants_map = PARTICIPANTS_FIN if cot_type == "financial" else PARTICIPANTS_COM
+class DataLoadError(RuntimeError):
+    """The source could not supply a usable report."""
 
-def color_percentiles(val):
-    """Red (0%) → Green (100%)"""
-    if pd.isna(val):
-        return ''
-    red = int(255 * (100 - val) / 100)
-    green = int(255 * val / 100)
-    return f'background-color: rgb({red},{green},0)'
 
-for p_name, _ in participants_map.items():
-    st.markdown(f"**{p_name}**")
-    # Get all participant columns, exclude 'asset'
-    cols = [col for col in pct_df.columns if col.startswith(p_name)]
-    df_show = pct_df[pct_df["asset"] == selected_asset][cols].copy()
-    
-    # Apply color styling
-    styled_df = df_show.style.applymap(color_percentiles).format("{:.2f}")
-    
-    # Render without index
-    st.markdown(styled_df.hide(axis="index").to_html(), unsafe_allow_html=True)
+def normalize_names(values):
+    return values.astype("string").str.strip().str.replace(r"\s+", " ", regex=True)
 
-# ----------------------------
-# Show Open Interest Section
-# ----------------------------
-if latest_date:
-    st.subheader(f"{selected_asset} OI (Latest: {latest_date})")
-else:
-    st.subheader(f"{selected_asset} OI")
 
-if selected_asset in df_dict:
-    df_temp = df_dict[selected_asset].copy()
-    df_temp["Date"] = pd.to_datetime(df_temp["Report_Date_as_YYYY-MM-DD"], errors="coerce")
-    df_temp = df_temp.dropna(subset=["Date"]).sort_values("Date")
+def prepare_report(df):
+    """Keep missing positions missing, normalize names, and remove duplicate weeks."""
+    required = {DATE_COLUMN, NAME_COLUMN, CODE_COLUMN}
+    missing = required.difference(df.columns)
+    if missing:
+        raise DataLoadError(f"CFTC report is missing columns: {', '.join(sorted(missing))}")
+    df = df.copy()
+    df["Date"] = pd.to_datetime(df[DATE_COLUMN], errors="coerce")
+    df = df.dropna(subset=["Date"])
+    df[NAME_COLUMN] = normalize_names(df[NAME_COLUMN])
+    df[CODE_COLUMN] = df[CODE_COLUMN].astype("string").str.strip().str.zfill(6)
+    numeric_columns = {"Open_Interest_All"}
+    for mapping in (PARTICIPANTS_FIN, PARTICIPANTS_COM, PARTICIPANTS_FIN_OI, PARTICIPANTS_COM_OI):
+        for columns in mapping.values():
+            numeric_columns.update(columns)
+    for column in numeric_columns:
+        if column in df:
+            values = df[column].astype("string").str.replace(",", "", regex=False)
+            df[column] = pd.to_numeric(values, errors="coerce")
+    return df.sort_values("Date").drop_duplicates([CODE_COLUMN, "Date"], keep="last")
 
-    if not df_temp.empty:
-        latest_row = df_temp.iloc[-1]
 
-        # Map participants
-        participants_map = PARTICIPANTS_FIN if cot_type == "financial" else PARTICIPANTS_COM
+@st.cache_data(ttl=6 * 60 * 60, max_entries=24, show_spinner=False)
+def fetch_year(year, cot_type="financial", basis="combined"):
+    """Read official CFTC ZIPs in memory; no shared extracted files between users."""
+    prefix = REPORT_PREFIXES[(cot_type, basis)]
+    url = f"https://www.cftc.gov/files/dea/history/{prefix}{year}.zip"
+    retry = Retry(total=2, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
+    try:
+        with requests.Session() as session:
+            session.mount("https://", HTTPAdapter(max_retries=retry))
+            response = session.get(url, timeout=(10, 40))
+            response.raise_for_status()
+        with ZipFile(BytesIO(response.content)) as archive:
+            files = [name for name in archive.namelist() if name.lower().endswith(".txt")]
+            if len(files) != 1:
+                raise DataLoadError(f"Unexpected contents in the CFTC archive for {year}.")
+            with archive.open(files[0]) as report:
+                df = pd.read_csv(report, dtype={CODE_COLUMN: "string"}, low_memory=False)
+        return prepare_report(df)
+    except (requests.RequestException, BadZipFile, pd.errors.ParserError) as exc:
+        raise DataLoadError(f"Could not load the CFTC {year} report. Please retry later.") from exc
 
-        for p_name, (long_col, short_col) in participants_map.items():
-            st.markdown(f"**{p_name}**")
 
-            # Construct dictionary for OI + Pct of OI
-            oi_data = {
-                "Long OI": latest_row.get(long_col, 0),
-                "Short OI": latest_row.get(short_col, 0),
-                "Net OI": latest_row.get(long_col, 0) - latest_row.get(short_col, 0),
-                "% Long OI": latest_row.get(f"Pct_of_OI_{long_col.replace('_Positions_', '_')}", 0),
-                "% Short OI": latest_row.get(f"Pct_of_OI_{short_col.replace('_Positions_', '_')}", 0),
-                "% Net OI": (latest_row.get(f"Pct_of_OI_{long_col.replace('_Positions_', '_')}", 0)
-                             - latest_row.get(f"Pct_of_OI_{short_col.replace('_Positions_', '_')}", 0))
-            }
+def fetch_cot_data(cot_type="financial", basis="combined", today=None):
+    today = pd.Timestamp(today if today is not None else date.today())
+    # One extra prior year covers the 18-month window around delayed reports.
+    years = range(today.year - 2, today.year + 1)
+    frames = [fetch_year(year, cot_type, basis) for year in years]
+    return prepare_report(pd.concat(frames, ignore_index=True))
 
-            st.dataframe(pd.DataFrame([oi_data]), use_container_width=True, hide_index=True)
 
+def select_market(report, asset, names):
+    if asset in FX_CONTRACT_CODES:
+        matches = report.loc[report[CODE_COLUMN].eq(FX_CONTRACT_CODES[asset])].copy()
     else:
-        st.info("No open interest data available for this asset.")
+        aliases = normalize_names(pd.Series(names, dtype="string"))
+        matches = report.loc[report[NAME_COLUMN].isin(aliases)].copy()
+    if matches[CODE_COLUMN].nunique() > 1:
+        raise DataLoadError("Multiple CFTC contract codes match this label; select a specific contract code before combining them.")
+    return matches.sort_values("Date")
+
+
+def numeric_series(df, column):
+    if column not in df:
+        return pd.Series(float("nan"), index=df.index, dtype="float64")
+    return pd.to_numeric(df[column], errors="coerce").astype("float64")
+
+
+def participant_map(cot_type, percentage=False):
+    if percentage:
+        return PARTICIPANTS_FIN_OI if cot_type == "financial" else PARTICIPANTS_COM_OI
+    return PARTICIPANTS_FIN if cot_type == "financial" else PARTICIPANTS_COM
+
+
+def compute_percentiles(df, cot_type="financial", months_list=LOOKBACKS):
+    """Rank the latest report against its own trailing window, including that report.
+
+    Ties use scipy's 'rank' convention (average of matching ranks).
+    Each metric has its own non-missing observation count.
+    """
+    columns = ["Participant", "Lookback", "Metric", "Value", "Percentile", "Observations", "Partial history"]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    df = df.sort_values("Date")
+    as_of = df["Date"].iloc[-1]
+    rows = []
+    for participant, (long_col, short_col) in participant_map(cot_type).items():
+        long = numeric_series(df, long_col)
+        short = numeric_series(df, short_col)
+        for months in months_list:
+            cutoff = as_of - pd.DateOffset(months=months)
+            in_window = df["Date"].between(cutoff, as_of)
+            for metric, values in {"Long": long, "Short": short, "Net": long - short}.items():
+                history = values.loc[in_window].dropna()
+                latest = values.iloc[-1]
+                rank = float("nan")
+                if pd.notna(latest) and not history.empty:
+                    rank = float(percentileofscore(history, latest, kind="rank"))
+                first_valid = df.loc[in_window & values.notna(), "Date"].min()
+                partial = pd.isna(first_valid) or first_valid > cutoff + pd.Timedelta(days=7)
+                rows.append({"Participant": participant, "Lookback": f"{months}m", "Metric": metric,
+                             "Value": latest, "Percentile": rank, "Observations": len(history),
+                             "Partial history": bool(partial)})
+    return pd.DataFrame(rows, columns=columns)
+
+
+def color_percentiles(value):
+    if pd.isna(value):
+        return ""
+    value = max(0.0, min(100.0, float(value)))
+    red = int(255 * (100 - value) / 100)
+    green = int(255 * value / 100)
+    return f"background-color: rgb({red},{green},0); color: #111111"
+
+
+def style_percentiles(table):
+    # Styler.applymap was removed in pandas 3.0. map works in pandas >= 2.1.
+    return table.style.map(color_percentiles).format("{:.2f}", na_rep="—")
+
+
+def plot_positions(asset, df, cot_type="financial", months_back=18, percentage=False):
+    as_of = df["Date"].max()
+    frame = df.loc[df["Date"] >= as_of - pd.DateOffset(months=months_back)]
+    mapping = participant_map(cot_type, percentage)
+    fig = make_subplots(rows=len(mapping), cols=1, shared_xaxes=True, subplot_titles=list(mapping))
+    for row, (participant, (long_col, short_col)) in enumerate(mapping.items(), start=1):
+        long, short = numeric_series(frame, long_col), numeric_series(frame, short_col)
+        fig.add_trace(go.Bar(x=frame["Date"], y=long, name="Long", marker_color="#31b79a",
+                             legendgroup="long", showlegend=row == 1), row=row, col=1)
+        fig.add_trace(go.Bar(x=frame["Date"], y=-short, name="Short", marker_color="#ed7680",
+                             legendgroup="short", showlegend=row == 1), row=row, col=1)
+        fig.add_trace(go.Scatter(x=frame["Date"], y=long - short, name="Net", mode="lines",
+                                 line_color="#e2b95b", connectgaps=False, legendgroup="net",
+                                 showlegend=row == 1), row=row, col=1)
+        fig.update_yaxes(title_text="% of OI" if percentage else "Contracts", row=row, col=1)
+    fig.update_layout(height=250 * len(mapping), barmode="relative", hovermode="x unified",
+                      title=f"{asset} · {months_back} months through {as_of:%Y-%m-%d}")
+    return fig
+
+
+def latest_positions(df, cot_type):
+    rows = []
+    for participant, (long_col, short_col) in participant_map(cot_type).items():
+        long = numeric_series(df, long_col).iloc[-1]
+        short = numeric_series(df, short_col).iloc[-1]
+        long_pct_col, short_pct_col = participant_map(cot_type, True)[participant]
+        long_pct = numeric_series(df, long_pct_col).iloc[-1]
+        short_pct = numeric_series(df, short_pct_col).iloc[-1]
+        rows.append({"Participant": participant, "Long": long, "Short": short, "Net": long - short,
+                     "Long % of OI": long_pct, "Short % of OI": short_pct,
+                     "Net % of OI": long_pct - short_pct})
+    return pd.DataFrame(rows).set_index("Participant")
+
+
+def main():
+    st.set_page_config(page_title="CFTC Positioning", layout="wide")
+    st.title("CFTC Markets Participants Positioning")
+    pages = {"FX Futures": MARKETS_FX, "Rate Futures": MARKETS_RATE, "Crypto Futures": MARKETS_CRYPTO,
+             "Equity Index Futures": MARKETS_INDICES, "Commodity Futures": MARKETS_COMMODITIES}
+    page = st.sidebar.selectbox("Select Market Page", list(pages))
+    asset = st.sidebar.selectbox(f"Select Asset ({page})", list(pages[page]),
+                                format_func=lambda name: f"{name} — no verified CFTC series" if name in UNAVAILABLE_FX else name)
+    basis_label = st.sidebar.selectbox("Report basis", ["Futures + options combined", "Futures only"])
+    basis = "combined" if basis_label == "Futures + options combined" else "futures"
+    cot_type = "commodity" if page == "Commodity Futures" else "financial"
+    if st.sidebar.button("Refresh data"):
+        fetch_year.clear()
+    st.caption(f"Source: CFTC · {basis_label} · Weekly report dates, not publication dates.")
+    if basis == "combined":
+        st.caption("Options are converted to futures-equivalent positions in the combined report.")
+    if asset in UNAVAILABLE_FX:
+        st.info(f"No verified CFTC TFF series is configured for {asset}. No matching currency series was found in the 2025–2026 TFF files checked on 23 September 2026. Exchange listing alone does not establish COT report coverage.")
+        st.caption("SGX-listed contracts require a separate SGX source; CME and SGX positions are distinct.")
+        return
+    try:
+        with st.spinner("Loading CFTC reports…"):
+            report = fetch_cot_data(cot_type, basis)
+        df = select_market(report, asset, pages[page][asset])
+    except DataLoadError as exc:
+        logging.getLogger(__name__).exception("CFTC report load failed")
+        st.error(str(exc))
+        return
+    if df.empty:
+        st.warning(f"No matching data was found for {asset} in the loaded {basis_label.lower()} reports.")
+        st.caption("The contract may be absent from this report, discontinued, or listed under a different name.")
+        return
+    as_of = df["Date"].max()
+    source_latest = report["Date"].max()
+    if as_of < source_latest:
+        st.warning(f"This market's last report is {as_of:%Y-%m-%d}; the latest loaded report is {source_latest:%Y-%m-%d}. Its history may have stopped.")
+    elif pd.Timestamp(date.today()) - as_of > pd.Timedelta(days=14):
+        st.warning(f"The latest available report is {as_of:%Y-%m-%d}. The source may be delayed; try Refresh data.")
+    expected = [column for pair in participant_map(cot_type).values() for column in pair]
+    missing_columns = [column for column in expected if column not in df]
+    if missing_columns:
+        st.warning("Some participant fields are unavailable. Missing values are shown as blank, not zero.")
+    st.subheader(f"{asset} · Latest report: {as_of:%Y-%m-%d}")
+    st.caption(f"CFTC contract code: {df[CODE_COLUMN].iloc[-1]} · {df[NAME_COLUMN].iloc[-1]}")
+    st.plotly_chart(plot_positions(asset, df, cot_type), width="stretch")
+    st.subheader("Positions as a percentage of total open interest")
+    st.plotly_chart(plot_positions(asset, df, cot_type, percentage=True), width="stretch")
+    st.caption("Short bars are drawn below zero for readability. Net % of OI = long % minus short %.")
+    st.subheader("Positioning percentiles")
+    st.caption("Each rank compares the latest value with the preceding 12 or 18 calendar months, including the latest report. Ties use average ranks. Green means a higher percentile, including for short positions; it is not a bullish signal.")
+    percentiles = compute_percentiles(df, cot_type)
+    if percentiles["Partial history"].any():
+        st.warning("Some metrics have less than the requested history. Their percentiles use only available observations; see counts below.")
+    for participant in participant_map(cot_type):
+        st.markdown(f"**{participant}**")
+        subset = percentiles.loc[percentiles["Participant"] == participant]
+        table = subset.pivot(index="Metric", columns="Lookback", values="Percentile").reindex(["Long", "Short", "Net"])
+        table = table.reindex(columns=[f"{months}m" for months in LOOKBACKS])
+        st.dataframe(style_percentiles(table), width="stretch")
+    with st.expander("Observation counts and history coverage"):
+        st.dataframe(percentiles[["Participant", "Lookback", "Metric", "Observations", "Partial history"]], hide_index=True)
+    st.subheader("Latest participant positions")
+    current = latest_positions(df, cot_type)
+    formats = {column: "{:,.0f}" if column in ("Long", "Short", "Net") else "{:.2f}" for column in current.columns}
+    st.dataframe(current.style.format(formats, na_rep="—"), width="stretch")
+    st.caption("The four displayed participant groups are retained from the original dashboard. Financial charts omit Other Reportables; commodity charts omit Swap Dealers. They are not a complete breakdown of total open interest.")
+    safe_name = asset.lower().replace(" ", "_").replace("/", "_")
+    st.download_button("Download selected market history", df.to_csv(index=False).encode("utf-8"),
+                       file_name=f"{safe_name}_{basis}.csv", mime="text/csv")
+    st.download_button("Download percentiles", percentiles.to_csv(index=False).encode("utf-8"),
+                       file_name=f"{safe_name}_{basis}_percentiles.csv", mime="text/csv")
+
+
+if __name__ == "__main__":
+    main()
+
